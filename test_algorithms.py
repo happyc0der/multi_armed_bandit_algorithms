@@ -1,9 +1,7 @@
 """
-test_algorithms.py -- head-to-head comparison of FastAdSwitch and TS-GE on
-the exact same synthetic environment (same seed, same change schedule),
-using the shared BanditAlgorithm interface. This is the harness that
-future algorithms (UCB1, epsilon-greedy, market_env-backed runs, etc.)
-should also plug into.
+test_algorithms.py -- head-to-head comparison of FastAdSwitch, TS-GE, UCB1,
+and EpsilonGreedy on the exact same synthetic environment (same seed, same
+change schedule), using the shared BanditAlgorithm interface.
 
 Run with:  python test_algorithms.py
 Saves a comparison plot to artifacts/algorithm_comparison.png
@@ -15,25 +13,30 @@ import matplotlib.pyplot as plt
 from synthetic_env import SyntheticEnv, regret_from_history
 from fast_adswitch import FastAdSwitch
 from ts_ge import TS_GE
+from ucb1 import UCB1
+from epsilon_greedy import EpsilonGreedy
+from mucb import MUCB
 
 ARTIFACT_DIR = "artifacts"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
+R_max = 20.0
 
-
-def run_comparison(K, T, means, change_schedule, env_seed=42):
+def run_comparison(K, T, means,sigma,delta,change_schedule, env_seed=42):
     results = {}
 
-    env1 = SyntheticEnv(K=K, means=means, sigma=1.0, change_schedule=list(change_schedule), seed=env_seed)
-    algo1 = FastAdSwitch(K=K, T=T, C1=1.0, seed=1)
-    h1 = algo1.run(env1.reward_fn)
-    regret1 = regret_from_history(h1, env1.best_mean_history)
-    results["FastAdSwitch"] = dict(history=h1, regret=regret1)
+    def add(name, algo_factory):
+        env = SyntheticEnv(K=K, means=means, sigma=sigma,
+                            change_schedule=list(change_schedule), seed=env_seed)
+        algo = algo_factory()
+        h = algo.run(env.reward_fn)
+        regret = regret_from_history(h, env.best_mean_history)
+        results[name] = dict(history=h, regret=regret, detections=h.get("detections", []))
 
-    env2 = SyntheticEnv(K=K, means=means, sigma=1.0, change_schedule=list(change_schedule), seed=env_seed)
-    algo2 = TS_GE(K=K, T=T, delta=0.1, R_min=min(means) - 3, R_max=max(means) + 3, seed=5)
-    h2 = algo2.run(env2.reward_fn)
-    regret2 = regret_from_history(h2, env2.best_mean_history)
-    results["TS-GE"] = dict(history=h2, regret=regret2, detections=h2.get("detections", []))
+    add("FastAdSwitch", lambda: FastAdSwitch(K=K, T=T, C1=1.0, seed=1))
+    add("TS-GE", lambda: TS_GE(K=K, T=T, delta=delta,R_max=R_max, seed=1))
+    add("UCB1", lambda: UCB1(K=K, T=T,sigma=sigma, seed=1))
+    add("EpsilonGreedy", lambda: EpsilonGreedy(K=K, T=T, epsilon=0.1, decay=False, seed=1))
+    add("M-UCB", lambda: MUCB(K=K, T=T, delta=2.0, M_estimate=2, seed=1))
 
     return results
 
@@ -41,10 +44,13 @@ def run_comparison(K, T, means, change_schedule, env_seed=42):
 if __name__ == "__main__":
     T = 6000
     K = 2
-    means = [0.2, 0.6]
-    change_schedule = [(3000, 0, 1.6)]  # arm 0 jumps from 0.2 to 1.6 at t=3000
+    means = [2.0, 6.0]       # non-negative, as the paper assumes
+    sigma = 0.5     
+    delta = 0.1# only for TS-GE
+    R_max = 20.0   # only for TS-GE          # tight bound covering the post-change max (16) plus margin
+    schedule = [(3000, 0, 16.0)]   # Delta_C=14, respects Assumption 3 (Delta_C >= 2*sigma)
 
-    results = run_comparison(K, T, means, change_schedule)
+    results = run_comparison(K, T, means,sigma,delta, schedule)
 
     print(f"{'Algorithm':<15} | {'Total Reward':>12} | {'Cum Regret':>10} | {'Rounds Played':>13}")
     for name, r in results.items():
@@ -59,7 +65,7 @@ if __name__ == "__main__":
     ax.axvline(3000, color="red", linestyle="--", alpha=0.6, label="true change point")
     ax.set_xlabel("Round")
     ax.set_ylabel("Cumulative regret")
-    ax.set_title("FastAdSwitch vs TS-GE: cumulative regret on identical environment")
+    ax.set_title("Algorithm comparison: cumulative regret on identical environment")
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(ARTIFACT_DIR, "algorithm_comparison.png"), dpi=150)

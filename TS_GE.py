@@ -1,28 +1,63 @@
 """
-algorithms/ts_ge.py -- TS-GE (Ghatak, "Actively Tracking the Optimal Arm
-in Non-Stationary Environments with Mandatory Probing"), refactored onto
-the shared BanditAlgorithm interface so it can be benchmarked head-to-head
-against FastAdSwitch (and future baselines) on the exact same environment.
+ts_ge.py -- TS-GE (Ghatak). Cross-checked against the arXiv version history
+of this paper (arXiv:2205.10366): v1 (May 2022, matches the PDF you
+originally gave me) -> v2 (Nov 2022, WITHDRAWN) -> v3 (Nov 2022, current,
+retitled "Fast Change Identification in Multi-Play Bandits...", changelog:
+"Corrected the assumptions and removed the case-study due to an error").
 
-What changed vs. the standalone TS_GE.py:
-  - No longer owns its own reward simulation (_draw / _apply_changes /
-    true_means). All rewards now come from the environment's
-    `reward_fn(arm_or_arms, t)` callback -- the algorithm never sees the
-    environment's true means, which is more realistic (the paper's own
-    Assumption 1 only grants the algorithm knowledge of R_min/R_max, an
-    assumed reward range, not the arm means themselves).
-  - R_min / R_max are now REQUIRED constructor arguments instead of being
-    auto-derived from the (now-hidden) true means -- you must supply your
-    own assumed reward bounds, exactly as the paper's Assumption 1 requires.
-  - Padding ("dummy") arms added to round K up to a power of two are
-    handled internally with a fixed constant reward (never queried from
-    the environment, since the environment only knows about your K real
-    arms) -- see _single()/_group() below.
+=====================================================================
+Fix (v3-confirmed): NO extra bit needed for the K=2^d edge case
+=====================================================================
+d = log2(K) exactly, no padding. v3 clarifies: for EVERY group (flagged
+or not), the changed arm must be in that group if flagged, or in its
+COMPLEMENT if not; intersecting across all groups naturally identifies
+arm index 0 (all-zero bit-code, member of zero groups) as the unique arm
+consistent with ALL groups being unflagged. My exact-bit-match check
+already implements this correctly.
 
-Everything else (ETC init, alternating TS/Broadcast-Probing episodes,
-Group Exploration bit-coded super-arm localization) is the same algorithm
-already validated in the standalone version: a scheduled mean-jump was
-detected within ~1 episode length and correctly localized/adapted to.
+=====================================================================
+NEW gap found while testing the above: Eq. 8 cannot estimate arm 0's mean
+=====================================================================
+Removing the extra bit exposed a real problem, distinct from the
+identification question: v3 explains how to IDENTIFY arm 0 as the changed
+arm (it's the one in zero groups, all consistent-with-unflagged), but its
+mean-recovery formula (Eq. 8) sums over "flagged groups containing the
+changed arm" -- and arm 0 belongs to NO groups, flagged or not, so that
+sum is structurally empty. Verified directly: without a fallback, arm 0's
+mean/prior never got updated after being correctly identified, so the BP
+phase kept re-flagging the same uncorrected drift every episode
+indefinitely (detections at t=3024, 3535, 4046, 4557, 5068, 5579, ...,
+instead of a single genuine detection).
+FIXED by falling back to the Broadcast Probing phase's own aggregate
+deviation to recover arm 0's new mean directly: since exactly one arm
+changed and BP phase reward is the K-arm average, new_mu_j = old mu_hat(j)
++ K * (mu_bp - mu_baseline). This is only used for the (rare, K=2^d-only)
+case where the identified arm belongs to zero groups; all other arms still
+use the paper's Eq. 8 group-subtraction recovery.
+
+=====================================================================
+Still-unresolved: the alpha/beta update direction (verified against v3)
+=====================================================================
+v3 Algorithm 1, lines 11-12, are BYTE-IDENTICAL to v1:
+    alpha_j <- alpha_j + 1 - R*
+    beta_j  <- beta_j + R*
+Backwards from standard Thompson Sampling convention. NOT part of what
+got fixed in the v1->v3 revision, so no official errata confirms it's a
+typo -- but empirically, the literal version gives ~3.5x worse regret and
+systematically favors low-reward arms. Default here is the standard-
+convention fix (`paper_literal=False`); set `paper_literal=True` to
+reproduce the paper's literal formula.
+
+Two other bugs found and fixed earlier (implementation errors on my end,
+not paper issues):
+  FIX #1 -- Beta-prior reseed after Group Exploration: reinitialize
+    (alpha, beta) from the changed arm's own new mean, borrowing only
+    the pseudo-count (confidence) from the closest arm, not its success
+    rate (copying verbatim was wrong whenever "closest" wasn't actually
+    close in absolute terms).
+  FIX #2 -- Changed-arm identification requires an EXACT bit-vector
+    match against the flagged-groups pattern (implements v3's
+    complement-intersection rule, Eq. 5), not a "subset" test.
 """
 import math
 import numpy as np
@@ -31,22 +66,21 @@ from bandit_base import BanditAlgorithm
 
 
 class TS_GE(BanditAlgorithm):
-    def __init__(self, K, T, delta, R_min, R_max, n_ge=None, seed=None, dummy_mean=None):
+    def __init__(self, K, T, delta, R_max, n_ge=None, seed=None,
+                 dummy_mean=None, paper_literal=False):
         """
-        K        : number of real arms
-        T        : time horizon
-        delta    : localization threshold (see paper); smaller = more
-                   sensitive detection but needs more ETC/GE samples
-        R_min    : assumed lower bound on any real reward the algorithm
-                   will see (used only to normalize the Bernoulli success
-                   signal for the TS phase's Beta posteriors)
-        R_max    : assumed upper bound on any real reward
-        n_ge     : override for the GE phase's per-super-arm sample count
-                   (not given as an explicit formula in the paper; default
-                   is the same order as the ETC phase's sample count)
-        dummy_mean : reward value used for padding arms (added to round K
-                   up to a power of two); defaults to just below R_min so
-                   their Bernoulli success probability is ~0
+        K              : number of real arms
+        T              : time horizon
+        delta          : localization threshold (see paper)
+        R_max          : known upper bound on reward (rewards assumed
+                         non-negative; R/R_max is a direct ratio)
+        n_ge           : override for the GE phase's per-super-arm
+                         sample count
+        dummy_mean     : reward for padding arms (added to round K up to
+                         a power of two)
+        paper_literal  : if True, use the paper's literal (apparently
+                         inverted) Beta update. Default False uses the
+                         standard TS convention that actually works.
         """
         super().__init__(K, T)
         self.num_real = K
@@ -54,23 +88,20 @@ class TS_GE(BanditAlgorithm):
         while Kp < K:
             Kp *= 2
         self.K = Kp
-        self.d = int(math.ceil(math.log2(Kp + 1)))
+        self.d = max(int(round(math.log2(Kp))), 1)
         self.delta = delta
-        self.R_min, self.R_max = R_min, R_max
-        self.dummy_mean = dummy_mean if dummy_mean is not None else (R_min - (R_max - R_min) / 2)
+        self.R_max = R_max
+        self.dummy_mean = dummy_mean if dummy_mean is not None else -10 * R_max
         self.n_ge = n_ge or max(int(1 / (2 * delta ** 2) * math.log(max(T, 2))), 3)
+        self.paper_literal = paper_literal
         self.rng = np.random.default_rng(seed)
 
     def _single(self, reward_fn, idx, t):
-        """Reward for one arm; padding arms never touch the environment."""
         if idx < self.num_real:
             return reward_fn(idx, t)
         return self.dummy_mean
 
     def _group(self, reward_fn, indices, t):
-        """Mean reward across a mixed real/padding group: query the
-        environment only for the real arms in the group, and combine with
-        the fixed constant for any padding arms in the group."""
         real_idx = [i for i in indices if i < self.num_real]
         n_dummy = len(indices) - len(real_idx)
         total = 0.0
@@ -80,18 +111,16 @@ class TS_GE(BanditAlgorithm):
         return total / len(indices)
 
     def _bernoulli_signal(self, r):
-        p = np.clip((r - self.R_min) / (self.R_max - self.R_min), 0.0, 1.0)
+        p = np.clip(r / self.R_max, 0.0, 1.0)
         return self.rng.binomial(1, p)
 
     def _construct_super_arms(self):
         """Algorithm 2 (CSA): arm i (0-indexed) belongs to super-arm k iff
-        bit k of (i+1) is set (1-indexed coding avoids the all-zero
-        codeword arm index 0 would otherwise get)."""
+        bit k of i is set. K = 2^d, exactly d groups."""
         B = [[] for _ in range(self.d)]
         for i in range(self.K):
-            code = i + 1
             for k in range(self.d):
-                if (code >> k) & 1:
+                if (i >> k) & 1:
                     B[k].append(i)
         return B
 
@@ -135,8 +164,12 @@ class TS_GE(BanditAlgorithm):
                 j = int(np.argmax(theta))
                 r = self._single(reward_fn, j, t + 1)
                 r_pi = self._bernoulli_signal(r)
-                alpha[j] += 1 - r_pi
-                beta[j] += r_pi
+                if self.paper_literal:
+                    alpha[j] += 1 - r_pi
+                    beta[j] += r_pi
+                else:
+                    alpha[j] += r_pi
+                    beta[j] += 1 - r_pi
                 sum_reward[j] += r
                 n_pulls[j] += 1
                 t += 1
@@ -189,15 +222,8 @@ class TS_GE(BanditAlgorithm):
 
                 candidates = []
                 for i in range(K):
-                    code = i + 1
-                    bits = [(code >> k) & 1 for k in range(self.d)]
-                    belongs_only_to_flagged = all(
-                        flagged[k] for k in range(self.d) if bits[k] == 1
-                    )
-                    touches_a_flagged_group = any(
-                        bits[k] == 1 and flagged[k] for k in range(self.d)
-                    )
-                    if belongs_only_to_flagged and touches_a_flagged_group:
+                    bits = [bool((i >> k) & 1) for k in range(self.d)]
+                    if bits == flagged:
                         candidates.append(i)
 
                 if len(candidates) == 1:
@@ -208,13 +234,28 @@ class TS_GE(BanditAlgorithm):
                             others = sum(mu_hat(i) for i in B[k] if i != j)
                             est = len(B[k]) * mu_hat_B_new[k] - others
                             estimates.append(est)
-                    if estimates:
+
+                    # FIX: fallback for arms belonging to zero groups (e.g.
+                    # arm 0), where Eq.8's group-based recovery is
+                    # structurally impossible -- use the BP phase's own
+                    # aggregate deviation to recover the new mean instead.
+                    if not estimates:
+                        new_mu_j = mu_hat(j) + K * (mu_bp - mu_baseline)
+                    else:
                         new_mu_j = float(np.mean(estimates))
-                        sum_reward[j] = new_mu_j
-                        n_pulls[j] = 1
-                        others_idx = [i for i in range(K) if i != j]
-                        closest = min(others_idx, key=lambda i: abs(mu_hat(i) - new_mu_j))
-                        alpha[j], beta[j] = alpha[closest], beta[closest]
+
+                    sum_reward[j] = new_mu_j
+                    n_pulls[j] = 1
+                    others_idx = [i for i in range(K) if i != j]
+                    closest = min(others_idx, key=lambda i: abs(mu_hat(i) - new_mu_j))
+                    total_pseudo_count = alpha[closest] + beta[closest]
+                    p_j = np.clip(new_mu_j / self.R_max, 1e-3, 1 - 1e-3)
+                    if self.paper_literal:
+                        alpha[j] = (1 - p_j) * total_pseudo_count
+                        beta[j] = p_j * total_pseudo_count
+                    else:
+                        alpha[j] = p_j * total_pseudo_count
+                        beta[j] = (1 - p_j) * total_pseudo_count
 
         return dict(net_reward=sum(reward_hist), reward=reward_hist,
                     chosen_arm=chosen_hist, detections=detections)
