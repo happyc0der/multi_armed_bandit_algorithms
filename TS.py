@@ -13,6 +13,10 @@ Patched bugs (compared to the version currently in the repo):
 """
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+ARTIFACT_DIR = "artifacts"
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
 
 try:
     from scipy.stats import gaussian_kde
@@ -78,7 +82,7 @@ def draw_distributions(R, i):
     plt.xlabel('Average Satisfaction', fontsize=16)
     plt.ylabel('Density', fontsize=16)
     plt.tight_layout()
-    plt.savefig(f'ts_iteration_{i+1}.png', dpi=120)
+    plt.savefig(os.path.join(ARTIFACT_DIR, f'ts_iteration_{i+1}.png'), dpi=120)
     plt.close()
 
 
@@ -112,6 +116,6 @@ if __name__ == "__main__":
     plt.xlabel('True Mean', fontsize=16)
     plt.ylabel('Posterior Mean', fontsize=16)
     plt.tight_layout()
-    plt.savefig('ts_true_vs_posterior.png', dpi=120)
+    plt.savefig(os.path.join(ARTIFACT_DIR, 'ts_true_vs_posterior.png'), dpi=120)
     plt.close()
     print("Done. Saved ts_iteration_*.png and ts_true_vs_posterior.png")

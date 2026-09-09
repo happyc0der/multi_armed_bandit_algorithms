@@ -13,6 +13,9 @@ import time
 import math
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+ARTIFACT_DIR = "artifacts"
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 from fast_adswitch import FastAdSwitch
 
@@ -65,7 +68,7 @@ def test_stationary_regret():
     ax[1].set_ylabel("Regret / T")
     ax[1].set_title("Average per-round regret vs T\n(should trend toward 0)")
     fig.tight_layout()
-    fig.savefig("regret_vs_horizon.png", dpi=150)
+    fig.savefig(os.path.join(ARTIFACT_DIR, "regret_vs_horizon.png"), dpi=150)
     plt.close(fig)
     print("  saved plot -> regret_vs_horizon.png")
 
@@ -91,7 +94,7 @@ def test_switching_environment():
 
     # rolling average reward vs the (moving) optimal reward, to visualise tracking
     window = 50
-    reward_hist = res["regret_hist"][1:T + 1]
+    reward_hist = res["reward"][1:T + 1]
     def rolling(x, w):
         c = np.cumsum(np.insert(x, 0, 0))
         return (c[w:] - c[:-w]) / w
@@ -108,7 +111,7 @@ def test_switching_environment():
     ax.set_title("AdSwitch tracking a piecewise-stationary bandit\n(red dashed lines = true change points)")
     ax.legend()
     fig.tight_layout()
-    fig.savefig("switching_regret.png", dpi=150)
+    fig.savefig(os.path.join(ARTIFACT_DIR, "switching_regret.png"), dpi=150)
     plt.close(fig)
     print("  saved plot -> switching_regret.png")
 
@@ -285,11 +288,8 @@ def test_speed_comparison():
     ax.set_title("Runtime: original vs fast AdSwitch")
     ax.legend()
     fig.tight_layout()
-    fig.savefig("speed_comparison.png", dpi=150)
+    fig.savefig(os.path.join(ARTIFACT_DIR, "speed_comparison.png"), dpi=150)
     plt.close(fig)
-    print("  saved plot -> speed_comparison.png")
-    print("  (the original does not finish in practical time once T reaches the "
-          "thousands; the fast version handles T=5000+ in well under a second)")
 
 
 if __name__ == "__main__":
