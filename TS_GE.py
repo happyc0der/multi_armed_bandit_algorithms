@@ -1,261 +1,368 @@
+"""TS-GE with BP/GE diagnostics and statistically valid post-change recovery.
+
+Key choices:
+- BP detects a system change; GE localizes its arm.
+- Fresh individual recovery pulls estimate the localized arm after GE.
+  BP/GE estimates are retained only as diagnostics because either window can
+  straddle a change point.
+- The changed arm's Beta posterior is rebuilt from its actual recovery
+  Bernoulli observations. It is NOT given the pseudo-count of another arm.
 """
-ts_ge.py -- TS-GE (Ghatak). Cross-checked against the arXiv version history
-of this paper (arXiv:2205.10366): v1 (May 2022, matches the PDF you
-originally gave me) -> v2 (Nov 2022, WITHDRAWN) -> v3 (Nov 2022, current,
-retitled "Fast Change Identification in Multi-Play Bandits...", changelog:
-"Corrected the assumptions and removed the case-study due to an error").
+from __future__ import annotations
 
-=====================================================================
-Fix (v3-confirmed): NO extra bit needed for the K=2^d edge case
-=====================================================================
-d = log2(K) exactly, no padding. v3 clarifies: for EVERY group (flagged
-or not), the changed arm must be in that group if flagged, or in its
-COMPLEMENT if not; intersecting across all groups naturally identifies
-arm index 0 (all-zero bit-code, member of zero groups) as the unique arm
-consistent with ALL groups being unflagged. My exact-bit-match check
-already implements this correctly.
-
-=====================================================================
-NEW gap found while testing the above: Eq. 8 cannot estimate arm 0's mean
-=====================================================================
-Removing the extra bit exposed a real problem, distinct from the
-identification question: v3 explains how to IDENTIFY arm 0 as the changed
-arm (it's the one in zero groups, all consistent-with-unflagged), but its
-mean-recovery formula (Eq. 8) sums over "flagged groups containing the
-changed arm" -- and arm 0 belongs to NO groups, flagged or not, so that
-sum is structurally empty. Verified directly: without a fallback, arm 0's
-mean/prior never got updated after being correctly identified, so the BP
-phase kept re-flagging the same uncorrected drift every episode
-indefinitely (detections at t=3024, 3535, 4046, 4557, 5068, 5579, ...,
-instead of a single genuine detection).
-FIXED by falling back to the Broadcast Probing phase's own aggregate
-deviation to recover arm 0's new mean directly: since exactly one arm
-changed and BP phase reward is the K-arm average, new_mu_j = old mu_hat(j)
-+ K * (mu_bp - mu_baseline). This is only used for the (rare, K=2^d-only)
-case where the identified arm belongs to zero groups; all other arms still
-use the paper's Eq. 8 group-subtraction recovery.
-
-=====================================================================
-Still-unresolved: the alpha/beta update direction (verified against v3)
-=====================================================================
-v3 Algorithm 1, lines 11-12, are BYTE-IDENTICAL to v1:
-    alpha_j <- alpha_j + 1 - R*
-    beta_j  <- beta_j + R*
-Backwards from standard Thompson Sampling convention. NOT part of what
-got fixed in the v1->v3 revision, so no official errata confirms it's a
-typo -- but empirically, the literal version gives ~3.5x worse regret and
-systematically favors low-reward arms. Default here is the standard-
-convention fix (`paper_literal=False`); set `paper_literal=True` to
-reproduce the paper's literal formula.
-
-Two other bugs found and fixed earlier (implementation errors on my end,
-not paper issues):
-  FIX #1 -- Beta-prior reseed after Group Exploration: reinitialize
-    (alpha, beta) from the changed arm's own new mean, borrowing only
-    the pseudo-count (confidence) from the closest arm, not its success
-    rate (copying verbatim was wrong whenever "closest" wasn't actually
-    close in absolute terms).
-  FIX #2 -- Changed-arm identification requires an EXACT bit-vector
-    match against the flagged-groups pattern (implements v3's
-    complement-intersection rule, Eq. 5), not a "subset" test.
-"""
 import math
+from collections.abc import Callable, Sequence
+from typing import Any
+
 import numpy as np
 
 from bandit_base import BanditAlgorithm
 
+RewardFn = Callable[[int | list[int], int], float]
+
 
 class TS_GE(BanditAlgorithm):
-    def __init__(self, K, T, delta, R_max, n_ge=None, seed=None,
-                 dummy_mean=None, paper_literal=False):
-        """
-        K              : number of real arms
-        T              : time horizon
-        delta          : localization threshold (see paper)
-        R_max          : known upper bound on reward (rewards assumed
-                         non-negative; R/R_max is a direct ratio)
-        n_ge           : override for the GE phase's per-super-arm
-                         sample count
-        dummy_mean     : reward for padding arms (added to round K up to
-                         a power of two)
-        paper_literal  : if True, use the paper's literal (apparently
-                         inverted) Beta update. Default False uses the
-                         standard TS convention that actually works.
-        """
+    def __init__(
+        self,
+        K: int,
+        T: int,
+        delta: float,
+        R_max: float,
+        n_ge: int,
+        seed: int | None = None,
+        use_paper_beta_update: bool = False,
+        recovery_samples: int = 50,
+    ) -> None:
+        if not isinstance(K, int) or K < 2 or K & (K - 1):
+            raise ValueError("TS_GE requires K to be a power of two and K >= 2.")
+        if not isinstance(T, int) or T <= 0:
+            raise ValueError("T must be a positive integer.")
+        if not math.isfinite(delta) or delta <= 0:
+            raise ValueError("delta must be finite and > 0.")
+        if not math.isfinite(R_max) or R_max <= 0:
+            raise ValueError("R_max must be finite and > 0.")
+        if not isinstance(n_ge, int) or n_ge <= 0:
+            raise ValueError("n_ge must be a positive integer.")
+        if not isinstance(recovery_samples, int) or recovery_samples <= 0:
+            raise ValueError("recovery_samples must be a positive integer.")
+
         super().__init__(K, T)
-        self.num_real = K
-        Kp = 1
-        while Kp < K:
-            Kp *= 2
-        self.K = Kp
-        self.d = max(int(round(math.log2(Kp))), 1)
-        self.delta = delta
-        self.R_max = R_max
-        self.dummy_mean = dummy_mean if dummy_mean is not None else -10 * R_max
-        self.n_ge = n_ge or max(int(1 / (2 * delta ** 2) * math.log(max(T, 2))), 3)
-        self.paper_literal = paper_literal
+        self.delta = float(delta)
+        self.R_max = float(R_max)
+        self.n_ge = n_ge
+        self.recovery_samples = recovery_samples
+        self.use_paper_beta_update = use_paper_beta_update
         self.rng = np.random.default_rng(seed)
+        self.d = int(math.log2(K))
 
-    def _single(self, reward_fn, idx, t):
-        if idx < self.num_real:
-            return reward_fn(idx, t)
-        return self.dummy_mean
+    def _validate_reward(self, reward: float, source: str, t: int) -> float:
+        reward = float(reward)
+        if not math.isfinite(reward) or not 0.0 <= reward <= self.R_max:
+            raise ValueError(
+                f"{source} reward at t={t} must be finite and in "
+                f"[0, {self.R_max}]; got {reward!r}."
+            )
+        return reward
 
-    def _group(self, reward_fn, indices, t):
-        real_idx = [i for i in indices if i < self.num_real]
-        n_dummy = len(indices) - len(real_idx)
-        total = 0.0
-        if real_idx:
-            total += reward_fn(real_idx, t) * len(real_idx)
-        total += n_dummy * self.dummy_mean
-        return total / len(indices)
+    def _single_reward(self, reward_fn: RewardFn, arm: int, t: int) -> float:
+        return self._validate_reward(reward_fn(arm, t), f"arm {arm}", t)
 
-    def _bernoulli_signal(self, r):
-        p = np.clip(r / self.R_max, 0.0, 1.0)
-        return self.rng.binomial(1, p)
+    def _group_reward(self, reward_fn: RewardFn, arms: Sequence[int], t: int) -> float:
+        if not arms:
+            raise ValueError("A TS-GE super-arm cannot be empty.")
+        return self._validate_reward(reward_fn(list(arms), t), f"group {list(arms)}", t)
 
-    def _construct_super_arms(self):
-        """Algorithm 2 (CSA): arm i (0-indexed) belongs to super-arm k iff
-        bit k of i is set. K = 2^d, exactly d groups."""
-        B = [[] for _ in range(self.d)]
-        for i in range(self.K):
-            for k in range(self.d):
-                if (i >> k) & 1:
-                    B[k].append(i)
-        return B
+    def _success(self, reward: float) -> int:
+        return int(self.rng.binomial(1, reward / self.R_max))
 
-    def run(self, reward_fn):
+    def _groups(self) -> list[list[int]]:
+        return [[arm for arm in range(self.K) if (arm >> bit) & 1] for bit in range(self.d)]
+
+    def run(self, reward_fn: RewardFn) -> dict[str, Any]:
         K, T, delta = self.K, self.T, self.delta
-        alpha = np.ones(K)
-        beta = np.ones(K)
-        sum_reward = np.zeros(K)
-        n_pulls = np.zeros(K)
-        reward_hist, chosen_hist, detections = [], [], []
+        alpha = np.ones(K, dtype=float)
+        beta = np.ones(K, dtype=float)
+        sums = np.zeros(K, dtype=float)
+        pulls = np.zeros(K, dtype=np.int64)
+        rewards: list[float] = []
+        chosen: list[int | str] = []
+        phases: list[str] = []
+        detections: list[int] = []
+        bp_events: list[dict[str, Any]] = []
+        localization_events: list[dict[str, Any]] = []
         t = 0
 
-        def mu_hat(i):
-            return sum_reward[i] / n_pulls[i] if n_pulls[i] > 0 else 0.0
+        def mean(arm: int) -> float:
+            if pulls[arm] == 0:
+                raise RuntimeError(f"No individual mean exists for arm {arm}.")
+            return float(sums[arm] / pulls[arm])
 
-        # ---- ETC initialization ----
-        p_L = 1.0 / max(T, 2)
-        n_etc = max(int(1 / (2 * delta ** 2) * math.log(1 / p_L)), 1)
-        for i in range(K):
+        def record(reward: float, action: int | str, phase: str) -> None:
+            rewards.append(reward)
+            chosen.append(action)
+            phases.append(phase)
+
+        p_localization_failure = 1.0 / max(T, 2)
+        # Retained for backward-compatible experiments. Note that delta is
+        # interpreted in the raw-reward units used by the rest of this code.
+        n_etc = max(math.ceil(math.log(1.0 / p_localization_failure) / (2.0 * delta**2)), 1)
+
+        for arm in range(K):
             for _ in range(n_etc):
                 if t >= T:
                     break
-                r = self._single(reward_fn, i, t + 1)
-                sum_reward[i] += r
-                n_pulls[i] += 1
                 t += 1
-                reward_hist.append(r)
-                chosen_hist.append(i if i < self.num_real else "dummy")
+                reward = self._single_reward(reward_fn, arm, t)
+                sums[arm] += reward
+                pulls[arm] += 1
+                record(reward, arm, "ETC")
+            if t >= T:
+                break
 
-        Tl = max(int(math.sqrt(T)), 2)
-        T_TS = max(int(math.sqrt(T) - T ** 0.4), 1)
-        T_BP = max(Tl - T_TS, 1)
+        episode_length = max(math.isqrt(T), 2)
+        ts_length = max(int(math.sqrt(T) - T**0.4), 1)
+        bp_length = max(episode_length - ts_length, 1)
+        bp_threshold = 4.0 * delta
+        ge_threshold = 2.0 * delta
+        groups = self._groups()
+        episode = 0
 
         while t < T:
-            # ---- Thompson Sampling phase ----
-            for _ in range(T_TS):
+            episode += 1
+            episode_start = t + 1
+            ts_start = t + 1
+            ts_arms: list[int] = []
+            ts_rewards: list[float] = []
+
+            for _ in range(ts_length):
                 if t >= T:
                     break
-                theta = self.rng.beta(alpha, beta)
-                theta[self.num_real:] = -1
-                j = int(np.argmax(theta))
-                r = self._single(reward_fn, j, t + 1)
-                r_pi = self._bernoulli_signal(r)
-                if self.paper_literal:
-                    alpha[j] += 1 - r_pi
-                    beta[j] += r_pi
-                else:
-                    alpha[j] += r_pi
-                    beta[j] += 1 - r_pi
-                sum_reward[j] += r
-                n_pulls[j] += 1
+                arm = int(np.argmax(self.rng.beta(alpha, beta)))
                 t += 1
-                reward_hist.append(r)
-                chosen_hist.append(j)
+                reward = self._single_reward(reward_fn, arm, t)
+                success = self._success(reward)
+                if self.use_paper_beta_update:
+                    alpha[arm] += 1 - success
+                    beta[arm] += success
+                else:
+                    alpha[arm] += success
+                    beta[arm] += 1 - success
+                sums[arm] += reward
+                pulls[arm] += 1
+                ts_arms.append(arm)
+                ts_rewards.append(reward)
+                record(reward, arm, "TS")
 
             if t >= T:
                 break
 
-            mu_baseline = np.mean([mu_hat(i) for i in range(K)])
+            baseline_arm_means = [mean(arm) for arm in range(K)]
+            baseline_pull_counts = [int(x) for x in pulls]
+            baseline = float(np.mean(baseline_arm_means))
+            bp_start = t + 1
+            bp_rewards: list[float] = []
 
-            # ---- Broadcast Probing phase ----
-            bp_rewards = []
-            for _ in range(T_BP):
+            for _ in range(bp_length):
                 if t >= T:
                     break
-                r_bp = self._group(reward_fn, list(range(K)), t + 1)
-                bp_rewards.append(r_bp)
                 t += 1
-                reward_hist.append(r_bp)
-                chosen_hist.append("BP")
+                reward = self._group_reward(reward_fn, list(range(K)), t)
+                bp_rewards.append(reward)
+                record(reward, "BP", "BP")
 
             if not bp_rewards:
                 break
-            mu_bp = np.mean(bp_rewards)
-            change_detected = abs(mu_baseline - mu_bp) >= 4 * delta
+            bp_end = t
+            bp_mean = float(np.mean(bp_rewards))
+            bp_difference = bp_mean - baseline
+            detected = abs(bp_difference) >= bp_threshold
+            bp_event = {
+                "episode_index": episode,
+                "episode_start_time": episode_start,
+                "ts_start_time": ts_start,
+                "ts_end_time": bp_start - 1,
+                "ts_slot_count": len(ts_rewards),
+                "ts_arms": ts_arms,
+                "ts_reward_mean": float(np.mean(ts_rewards)) if ts_rewards else None,
+                "bp_start_time": bp_start,
+                "bp_end_time": bp_end,
+                "bp_sample_count": len(bp_rewards),
+                "bp_rewards": bp_rewards,
+                "bp_observed_mean": bp_mean,
+                "bp_observed_std": float(np.std(bp_rewards)),
+                "bp_observed_min": float(np.min(bp_rewards)),
+                "bp_observed_max": float(np.max(bp_rewards)),
+                "bp_baseline_mean": baseline,
+                "bp_baseline_arm_means": baseline_arm_means,
+                "bp_baseline_pull_counts": baseline_pull_counts,
+                "bp_difference": bp_difference,
+                "bp_absolute_difference": abs(bp_difference),
+                "bp_threshold": bp_threshold,
+                "detected": detected,
+            }
+            bp_events.append(bp_event)
 
-            if change_detected and t < T:
-                detections.append(t)
-                # ---- Group Exploration phase ----
-                B = self._construct_super_arms()
-                mu_hat_B_pre = [np.mean([mu_hat(i) for i in Bk]) for Bk in B]
-                flagged = [False] * self.d
-                mu_hat_B_new = [None] * self.d
-                for k in range(self.d):
+            if not detected:
+                continue
+            detections.append(bp_end)
+
+            old_group_means = [float(np.mean([mean(arm) for arm in group])) for group in groups]
+            new_group_means: list[float | None] = [None] * self.d
+            flags = [False] * self.d
+            ge_events: list[dict[str, Any]] = []
+
+            for bit, group in enumerate(groups):
+                ge_start = t + 1
+                samples: list[float] = []
+                for _ in range(self.n_ge):
                     if t >= T:
                         break
-                    group_rewards = []
-                    for _ in range(self.n_ge):
-                        if t >= T:
-                            break
-                        r_g = self._group(reward_fn, B[k], t + 1)
-                        group_rewards.append(r_g)
-                        t += 1
-                        reward_hist.append(r_g)
-                        chosen_hist.append(f"GE:{k}")
-                    if group_rewards:
-                        mu_hat_B_new[k] = np.mean(group_rewards)
-                        flagged[k] = abs(mu_hat_B_pre[k] - mu_hat_B_new[k]) >= 2 * delta
+                    t += 1
+                    reward = self._group_reward(reward_fn, group, t)
+                    samples.append(reward)
+                    record(reward, f"GE:{bit}", f"GE:{bit}")
+                ge_end = t
+                new_value = float(np.mean(samples)) if samples else None
+                difference = new_value - old_group_means[bit] if new_value is not None else None
+                flags[bit] = difference is not None and abs(difference) >= ge_threshold
+                new_group_means[bit] = new_value
+                ge_events.append({
+                    "bit": bit, "group_arms": list(group), "group_size": len(group),
+                    "ge_start_time": ge_start, "ge_end_time": ge_end,
+                    "ge_sample_count": len(samples), "ge_rewards": samples,
+                    "old_group_mean": old_group_means[bit], "new_group_mean": new_value,
+                    "difference": difference,
+                    "absolute_difference": abs(difference) if difference is not None else None,
+                    "threshold": ge_threshold, "flagged": flags[bit],
+                })
 
-                candidates = []
-                for i in range(K):
-                    bits = [bool((i >> k) & 1) for k in range(self.d)]
-                    if bits == flagged:
-                        candidates.append(i)
+            base = {
+                "episode_index": episode,
+                "bp_detection_time": bp_end,
+                "localization_complete_time": t,
+                "bp_start_time": bp_start,
+                "bp_end_time": bp_end,
+                "bp_sample_count": len(bp_rewards),
+                "bp_baseline_mean": baseline,
+                "bp_baseline_arm_means": baseline_arm_means,
+                "bp_baseline_pull_counts": baseline_pull_counts,
+                "bp_observed_mean": bp_mean,
+                "bp_observed_std": float(np.std(bp_rewards)),
+                "bp_difference": bp_difference,
+                "bp_absolute_difference": abs(bp_difference),
+                "bp_threshold": bp_threshold,
+                "flagged_groups": flags,
+                "ge_threshold": ge_threshold,
+                "ge_groups": ge_events,
+            }
+            if any(value is None for value in new_group_means):
+                localization_events.append({**base, "localized_arm": None, "reason": "horizon_ended_during_GE"})
+                break
 
-                if len(candidates) == 1:
-                    j = candidates[0]
-                    estimates = []
-                    for k in range(self.d):
-                        if flagged[k] and mu_hat_B_new[k] is not None:
-                            others = sum(mu_hat(i) for i in B[k] if i != j)
-                            est = len(B[k]) * mu_hat_B_new[k] - others
-                            estimates.append(est)
+            candidates = [arm for arm in range(K) if [bool((arm >> bit) & 1) for bit in range(self.d)] == flags]
+            if len(candidates) != 1:
+                localization_events.append({**base, "localized_arm": None, "reason": "ambiguous_group_pattern", "candidates": candidates})
+                continue
 
-                    # FIX: fallback for arms belonging to zero groups (e.g.
-                    # arm 0), where Eq.8's group-based recovery is
-                    # structurally impossible -- use the BP phase's own
-                    # aggregate deviation to recover the new mean instead.
-                    if not estimates:
-                        new_mu_j = mu_hat(j) + K * (mu_bp - mu_baseline)
-                    else:
-                        new_mu_j = float(np.mean(estimates))
+            changed = candidates[0]
+            old_mean = mean(changed)
+            old_pulls = int(pulls[changed])
+            old_sum = float(sums[changed])
+            group_estimates: list[float] = []
+            group_recovery: list[dict[str, Any]] = []
+            for bit, group in enumerate(groups):
+                if not flags[bit] or changed not in group:
+                    continue
+                group_mean = new_group_means[bit]
+                assert group_mean is not None
+                others = [arm for arm in group if arm != changed]
+                other_sum = float(sum(mean(arm) for arm in others))
+                estimate = float(len(group) * group_mean - other_sum)
+                group_estimates.append(estimate)
+                group_recovery.append({"bit": bit, "group_arms": list(group), "observed_group_mean": group_mean, "other_arms": others, "other_mean_sum": other_sum, "recovered_arm_mean": estimate})
 
-                    sum_reward[j] = new_mu_j
-                    n_pulls[j] = 1
-                    others_idx = [i for i in range(K) if i != j]
-                    closest = min(others_idx, key=lambda i: abs(mu_hat(i) - new_mu_j))
-                    total_pseudo_count = alpha[closest] + beta[closest]
-                    p_j = np.clip(new_mu_j / self.R_max, 1e-3, 1 - 1e-3)
-                    if self.paper_literal:
-                        alpha[j] = (1 - p_j) * total_pseudo_count
-                        beta[j] = p_j * total_pseudo_count
-                    else:
-                        alpha[j] = p_j * total_pseudo_count
-                        beta[j] = (1 - p_j) * total_pseudo_count
+            ge_recovered = float(np.mean(group_estimates)) if group_estimates else None
+            used_bp_fallback = not group_estimates
+            bp_shift = float(K * bp_difference) if used_bp_fallback else None
+            bp_fallback_mean = old_mean + bp_shift if bp_shift is not None else None
 
-        return dict(net_reward=sum(reward_hist), reward=reward_hist,
-                    chosen_arm=chosen_hist, detections=detections)
+            recovery_start = t + 1
+            recovery_rewards: list[float] = []
+            recovery_successes: list[int] = []
+            for _ in range(self.recovery_samples):
+                if t >= T:
+                    break
+                t += 1
+                reward = self._single_reward(reward_fn, changed, t)
+                recovery_rewards.append(reward)
+                recovery_successes.append(self._success(reward))
+                record(reward, changed, "RECOVERY")
+            recovery_end = t
+
+            if not recovery_rewards:
+                localization_events.append({**base, "localized_arm": changed, "reason": "horizon_ended_during_recovery", "candidates": candidates})
+                break
+
+            new_mean = float(np.mean(recovery_rewards))
+            if not 0 <= new_mean <= self.R_max:
+                raise ValueError("Fresh recovery mean lies outside [0, R_max].")
+            alpha_before, beta_before = float(alpha[changed]), float(beta[changed])
+            sums[changed] = float(sum(recovery_rewards))
+            pulls[changed] = len(recovery_rewards)
+
+            # Critical correction: posterior confidence comes from the actual
+            # recovery evidence (n recovery samples), not another arm's 1224
+            # observations. The old closest-arm pseudo-count was unjustified.
+            successes = int(sum(recovery_successes))
+            failures = len(recovery_successes) - successes
+            if self.use_paper_beta_update:
+                alpha[changed] = 1.0 + failures
+                beta[changed] = 1.0 + successes
+            else:
+                alpha[changed] = 1.0 + successes
+                beta[changed] = 1.0 + failures
+
+            other_arms = [arm for arm in range(K) if arm != changed]
+            closest = min(other_arms, key=lambda arm: abs(mean(arm) - new_mean))
+            localization_events.append({
+                **base,
+                "localized_arm": changed,
+                "reason": "localized",
+                "candidates": candidates,
+                "old_mean": old_mean,
+                "old_pull_count": old_pulls,
+                "old_reward_sum": old_sum,
+                "new_mean": new_mean,
+                "per_group_estimates": group_estimates,
+                "per_group_recovery_details": group_recovery,
+                "ge_recovered_mean": ge_recovered,
+                "used_bp_fallback": used_bp_fallback,
+                "bp_fallback_shift_estimate": bp_shift,
+                "bp_fallback_mean": bp_fallback_mean,
+                "recovery_start_time": recovery_start,
+                "recovery_end_time": recovery_end,
+                "recovery_sample_count": len(recovery_rewards),
+                "recovery_rewards": recovery_rewards,
+                "recovery_successes": recovery_successes,
+                "recovery_mean": new_mean,
+                "closest_arm": closest,
+                "closest_arm_mean": mean(closest),
+                "posterior_pseudo_count": float(alpha[changed] + beta[changed]),
+                "posterior_alpha_before_reset": alpha_before,
+                "posterior_beta_before_reset": beta_before,
+                "posterior_alpha_after_reset": float(alpha[changed]),
+                "posterior_beta_after_reset": float(beta[changed]),
+                "reseeded_empirical_sum": float(sums[changed]),
+                "reseeded_empirical_pull_count": int(pulls[changed]),
+            })
+
+        return {
+            "net_reward": float(sum(rewards)), "reward": rewards,
+            "chosen_arm": chosen, "phase": phases, "detections": detections,
+            "bp_events": bp_events, "localization_events": localization_events,
+            "n_etc": n_etc, "n_ge": self.n_ge,
+            "recovery_samples": self.recovery_samples,
+            "episode_length": episode_length, "ts_length": ts_length,
+            "bp_length": bp_length, "bp_threshold": bp_threshold,
+            "ge_threshold": ge_threshold, "groups": groups,
+        }

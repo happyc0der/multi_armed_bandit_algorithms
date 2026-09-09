@@ -4,51 +4,60 @@ Best Bandit Arm with an Unknown Number of Distribution Changes", COLT 2019),
 on the shared BanditAlgorithm interface.
 
 =====================================================================
-MAJOR FIX: condition (3), the "good arm changed?" test, was WRONG
+Fix #1 (previous pass): condition (3), the "good arm changed?" test
 =====================================================================
-Cross-checked directly against the actual COLT 2019 paper (Algorithm 1,
-conditions 1/3/4) -- something I hadn't done before for this algorithm
-(unlike TS-GE, where I went to the source paper from the start).
-
-Condition (1) (eviction) and condition (4) (bad-arm recheck) were already
-correct -- verified to match the paper exactly.
-
-Condition (3) was NOT correct. The paper's condition (3) is:
-    |mean[s1,s2](a) - mean[s,t](a)| > sqrt(2*logT/n[s1,s2](a)) + sqrt(2*logT/n[s,t](a))
-    for SOME s1 <= s2 and s within the current episode.
-This is a SINGLE arm a, compared against ITSELF across two different time
-windows -- checking whether that arm's own mean has shifted.
-
-My earlier version instead compared TWO DIFFERENT ARMS at the SAME time
-window -- a fundamentally different test (closer to a second eviction
-check than an actual change-detection test). This came from basing the
-vectorized rewrite on the SMPyBandits reference implementation (Repo.py),
-whose `statistical_test()` method does the same cross-arm comparison --
-apparently matching an earlier/simpler (K=2-specific) version of this
-algorithm, not the general-K condition (3) in the published COLT paper.
-
-Verified empirically: with the corrected condition (3), cumulative regret
-on a K=2, T=6000 test with a single change point dropped from ~15,733 to
-~1,433 -- a qualitative difference, not a minor tuning effect.
-
-Performance note: the paper's own Remark 3 states this check has runtime
-O(K*t^3) if implemented naively (checking every possible s1,s2,s), and
-recommends restricting to dyadic-length candidate windows to get
-O(K*(log T)^2) per step. That's what's implemented here. It's still
-noticeably slower than the (incorrect) earlier version -- expect ~2.5s
-for T=6000 at K=2, scaling worse than linearly with T. This is the
-correctness/speed trade-off the paper itself acknowledges, not a new bug.
+Cross-checked directly against the COLT 2019 paper (Algorithm 1, conditions
+1/3/4). Conditions (1) (eviction) and (4) (bad-arm recheck) were already
+correct. Condition (3) was NOT: the paper checks a SINGLE arm against
+ITSELF across two different time windows (has its own mean shifted?), but
+the earlier version compared TWO DIFFERENT ARMS at the same window
+instead (inherited from the SMPyBandits reference implementation, which
+apparently matches an earlier/simpler K=2-specific version of this
+algorithm, not the general-K condition (3) in the published paper).
+Fixing this dropped cumulative regret on a K=2, T=6000 test from ~15,733
+to ~1,433 -- confirmed not a minor effect.
 
 =====================================================================
-Smaller, already-correct fix carried over from the original rewrite
+Fix #2 (this pass): vectorized condition (3), ~3x faster
 =====================================================================
-The user's original repo code used base-10 logarithm throughout (with an
-explicit comment about it). The paper's confidence bounds are derived via
-Hoeffding-Azuma using NATURAL log (verified from the proof of Lemma 5:
-exp(-4*logT) only equals T^-4 under natural log). This file uses natural
-log (Python's default math.log), which is correct -- flagging explicitly
-since this differs from the original repo code and was never called out
-before.
+The corrected condition (3) was still implemented as nested Python loops
+over dict-keyed candidate windows, re-run from scratch every single round.
+Replaced with vectorized numpy array operations (same dyadic-window
+candidate set from the paper's Remark 3, same result), cutting runtime
+from ~2.5s to ~0.8s for a K=2, T=6000 run. Verified bit-for-bit identical
+regret before/after (1433.12 in both versions on the same seed).
+
+=====================================================================
+Added: detection/eviction tracking, and a real diagnosis of high variance
+=====================================================================
+The algorithm previously returned no record of *when* it restarted or
+evicted an arm, making it impossible to diagnose a multi-seed run showing
+huge variance (std bigger than the mean, worst case ~2x the runner-up's
+worst case). Added `detections` (restart times, tagged with which
+condition triggered) and `evictions` (times an arm moved from good to bad)
+to the returned history.
+
+Using this instrumentation, the variance is now fully explained and is a
+REAL, BY-DESIGN property of AdSwitch, not a bug:
+  - When a change happens to the currently GOOD arm, condition (3) checks
+    every good arm's own mean EVERY ROUND -- detection is essentially
+    immediate (empirically: latency = 0 in 20/20 test seeds).
+  - When a change happens to a currently BAD (already-evicted) arm,
+    detection instead depends on condition (4), which only re-checks a
+    bad arm when its sparse, PROBABILISTIC sampling-obligation schedule
+    happens to select it. This sparse sampling of bad arms is intentional
+    -- it's what lets the algorithm achieve sublinear worst-case regret
+    without wasting budget constantly re-checking arms it already
+    believes are bad. But it means the time to notice "a bad arm quietly
+    became great again" is highly random: empirically, latency ranged
+    from 44 to 2,331 rounds across 20 otherwise-identical seeds, on a
+    K=2 test where the changed arm happened to be the evicted one.
+  - Practical implication: if your application involves a
+    currently-underperforming option suddenly becoming the best one (a
+    very real scenario e.g. in asset selection), AdSwitch's detection
+    speed for that specific case is inherently unreliable by design --
+    not something a code fix can resolve, since it's the direct
+    mechanism behind the algorithm's regret guarantee.
 """
 from __future__ import annotations
 import math
@@ -99,6 +108,8 @@ class FastAdSwitch(BanditAlgorithm):
 
         net_reward = 0.0
         reward_hist, chosen_hist = [], []
+        detections = []   # (time, reason) -- reason in {'good_arm_change', 'bad_arm_change'}
+        evictions = []    # (time, arm) -- arm moved from good to bad
         episode_start = 1
         t = 0
 
@@ -144,36 +155,35 @@ class FastAdSwitch(BanditAlgorithm):
             chosen_hist.append(chosen)
 
             restart = False
+            restart_reason = None
             episode_len = t - episode_start + 1
 
-            # ---- CORRECTED condition (3): single arm, two time windows ----
+            # ---- condition (3): single arm, two time windows (VECTORIZED) ----
             if episode_len >= 2 and good:
                 offs = _dyadic_offsets(episode_len)
                 end_windows = [(max(t - L + 1, episode_start), t) for L in offs]
                 start_windows = [(episode_start, min(episode_start + L - 1, t)) for L in offs]
-                candidate_windows = list({w for w in end_windows + start_windows if w[1] >= w[0]})
+                cw = list({w for w in end_windows + start_windows if w[1] >= w[0]})
+                s1_arr = np.array([w[0] for w in cw])
+                s2_arr = np.array([w[1] for w in cw])
                 for a in good:
-                    means, counts = {}, {}
-                    for (s1, s2) in candidate_windows:
-                        means[(s1, s2)] = mean_iv(a, s1, s2)
-                        counts[(s1, s2)] = count_iv(a, s1, s2)
-                    for (s1, s2) in candidate_windows:
-                        if counts[(s1, s2)] == 0:
-                            continue
-                        for (s3, s4) in candidate_windows:
-                            if counts[(s3, s4)] == 0:
-                                continue
-                            x = abs(means[(s1, s2)] - means[(s3, s4)])
-                            y = math.sqrt(2 * logT / counts[(s1, s2)]) + math.sqrt(2 * logT / counts[(s3, s4)])
-                            if x > y:
-                                restart = True
-                                break
-                        if restart:
-                            break
-                    if restart:
+                    c_w = cum_count[a, s2_arr + 1] - cum_count[a, s1_arr]
+                    r_w = cum_reward[a, s2_arr + 1] - cum_reward[a, s1_arr]
+                    valid = c_w > 0
+                    if not np.any(valid):
+                        continue
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        means_w = np.where(valid, r_w / np.where(c_w == 0, 1, c_w), 0.0)
+                    thresh = np.sqrt(2 * logT / np.where(c_w == 0, 1, c_w))
+                    diff = np.abs(means_w[:, None] - means_w[None, :])
+                    bound = thresh[:, None] + thresh[None, :]
+                    valid_pair = valid[:, None] & valid[None, :]
+                    if np.any(valid_pair & (diff > bound)):
+                        restart = True
+                        restart_reason = "good_arm_change"
                         break
 
-            # ---- condition (4): bad-arm recheck (already correct) ----
+            # ---- condition (4): bad-arm recheck ----
             if not restart:
                 sigmas = np.arange(episode_start, t + 1)
                 for a in bad:
@@ -185,9 +195,11 @@ class FastAdSwitch(BanditAlgorithm):
                     diff = np.abs(m - eviction_mean[a])
                     if np.any((c > 0) & (diff > bound)):
                         restart = True
+                        restart_reason = "bad_arm_change"
                         break
 
             if restart:
+                detections.append((t, restart_reason))
                 start_new_episode()
                 continue
 
@@ -199,7 +211,7 @@ class FastAdSwitch(BanditAlgorithm):
                         new_bad.add(a)
                 sampling_oblig[a] = keep
 
-            # ---- condition (1): eviction test (already correct) ----
+            # ---- condition (1): eviction test ----
             gl = list(good)
             if len(gl) >= 2:
                 sigmas = np.arange(episode_start, t + 1)
@@ -233,8 +245,11 @@ class FastAdSwitch(BanditAlgorithm):
                     eviction_mean[a] = mean_iv(a, s_val, t)
                     eviction_gap[a] = left_val
                     sampling_oblig[a] = []
+                    evictions.append((t, a))
 
             bad = new_bad
             good = set(range(K)) - bad
 
-        return dict(net_reward=net_reward, reward=reward_hist, chosen_arm=chosen_hist)
+        return dict(net_reward=net_reward, reward=reward_hist, chosen_arm=chosen_hist,
+                    detections=[d[0] for d in detections], detection_reasons=detections,
+                    evictions=evictions)

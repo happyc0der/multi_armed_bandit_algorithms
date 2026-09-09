@@ -71,7 +71,7 @@ def test_stationary_regret():
     fig.savefig(os.path.join(ARTIFACT_DIR, "regret_vs_horizon.png"), dpi=150)
     plt.close(fig)
     print("  saved plot -> regret_vs_horizon.png")
-
+    
 
 # ---------------------------------------------------------------------
 # Test 2: switching bandit -> algorithm should track the moving best arm
