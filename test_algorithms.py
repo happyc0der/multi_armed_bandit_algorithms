@@ -110,10 +110,17 @@ def select_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def _set_horizon(case: dict[str, Any], horizon: int) -> None:
-    """Retarget a case at a new horizon, keeping the change at the midpoint."""
+    """Retarget a case at a new horizon, rescaling its change schedule.
+
+    Change times are scaled by horizon/T rather than clamped, so a schedule with
+    several changes keeps them distinct and in the same relative positions. A
+    single change at T/2 still lands exactly at horizon/2.
+    """
+    original = case["T"]
     case["T"] = horizon
     case["change_schedule"] = [
-        (max(1, min(t, horizon // 2)), arm, mean) for t, arm, mean in case["change_schedule"]
+        (min(max(1, round(t * horizon / original)), horizon), arm, mean)
+        for t, arm, mean in case["change_schedule"]
     ]
 
 

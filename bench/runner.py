@@ -30,6 +30,7 @@ from .metrics import (
     dispersion,
     downsample_cumulative,
     downsample_x,
+    format_probe_age,
     summarize_run,
 )
 
@@ -47,12 +48,6 @@ class CaseResult:
     metrics: dict[str, list[RunMetrics]] = field(default_factory=dict)
     detail_seed: int = 0
     detail_histories: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-    def finals(self, attribute: str = "total_regret") -> dict[str, np.ndarray]:
-        return {
-            name: np.asarray([getattr(m, attribute) for m in runs], dtype=float)
-            for name, runs in self.metrics.items()
-        }
 
 
 def _make_env(case: dict[str, Any], seed: int) -> SyntheticEnv:
@@ -189,7 +184,7 @@ def save_summary_csv(result: CaseResult, path: str) -> None:
                 f"{d['min']:.6f}", f"{d['max']:.6f}",
                 f"{np.mean([m.decision_regret for m in runs]):.6f}",
                 f"{np.mean([m.probe_regret for m in runs]):.6f}",
-                max(m.max_probe_age for m in runs),
+                format_probe_age(max(m.max_probe_age for m in runs)),
                 f"{np.mean([len(m.detections) for m in runs]):.2f}",
                 _reason_histogram(result, runs),
                 f"{np.mean([m.wall_time_s for m in runs]):.3f}",
@@ -214,7 +209,7 @@ def save_per_seed_csv(result: CaseResult, path: str) -> None:
                     f"{metrics.decision_regret:.6f}",
                     f"{metrics.probe_regret:.6f}",
                     metrics.decision_slots, metrics.probe_slots,
-                    metrics.max_probe_age, f"{metrics.wall_time_s:.3f}",
+                    format_probe_age(metrics.max_probe_age), f"{metrics.wall_time_s:.3f}",
                     post[0] if post else "",
                     metrics.first_detection_reason(first_change),
                     ";".join(str(t) for t in metrics.detections),
@@ -301,7 +296,7 @@ def print_summary(result: CaseResult) -> None:
             f"{name:<15} | {d['mean']:14.2f} | {d['std']:12.2f} | {d['median']:13.2f} | "
             f"{np.mean([m.decision_regret for m in runs]):13.2f} | "
             f"{np.mean([m.probe_regret for m in runs]):13.2f} | "
-            f"{max(m.max_probe_age for m in runs):11d} | "
+            f"{format_probe_age(max(m.max_probe_age for m in runs)):>11s} | "
             f"{np.mean([m.wall_time_s for m in runs]):8.2f}s"
         )
         if d["std"] > d["mean"] * 0.5 and len(runs) > 2:
@@ -313,9 +308,8 @@ def print_summary(result: CaseResult) -> None:
                 f"(max/min = {d['max'] / max(d['min'], 1e-9):.0f}x) -- mean is not a summary here"
             )
 
-    change_points = [change[0] for change in result.case["change_schedule"]]
-    if change_points:
-        first_change = change_points[0]
+    first_change = _first_change(result)
+    if first_change:
         print("\nDetection latency (first detection at or after the first true change point):")
         for name, runs in result.metrics.items():
             latencies, reasons = [], {}

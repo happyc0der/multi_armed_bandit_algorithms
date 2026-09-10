@@ -73,7 +73,8 @@ is therefore reported three ways:
 - `total_regret` — what the paper's Eq. (2) charges
 - `decision_regret` — regret on slots where a single arm was chosen
 - `max_probe_age` — the longest any arm went unprobed after initialization,
-  which is what Condition 1 bounds by `sqrt(T)`
+  which is what Condition 1 bounds by `sqrt(T)`. Reported as `n/a` when a run
+  never leaves initialization, since Condition 1 was then never in force
 
 ## Results
 

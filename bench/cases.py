@@ -32,12 +32,6 @@ from mucb import MUCB
 from ts_ge import TS_GE
 from ucb1 import UCB1
 
-#: Algorithms still too expensive for a given case. FastAdSwitch used to live
-#: here -- 309.7 s for one K=64/T=60,000 seed, and two dense (K, T+2) arrays --
-#: but its condition-(4) scan and its storage have both been fixed, so it is now
-#: a default competitor everywhere except the T=1e6 case.
-HEAVY_ALGORITHMS: frozenset[str] = frozenset()
-
 ALL_ALGORITHMS = ("FastAdSwitch", "TS-GE", "UCB1", "EpsilonGreedy", "M-UCB")
 
 

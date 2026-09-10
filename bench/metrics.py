@@ -21,6 +21,8 @@ and with the metric TS-GE actually exists to deliver:
     max_probe_age   = the longest any arm went unprobed, individually or in a
                       group. This is Condition 1 in the paper, which bounds it
                       by sqrt(T). No competitor here offers such a bound.
+                      PROBE_AGE_NA when the run never left initialization, so
+                      there is no steady state for Condition 1 to govern.
 """
 from __future__ import annotations
 
@@ -34,6 +36,15 @@ from synthetic_env import regret_from_history
 # Sentinel codes for non-integer actions in the per-slot action array. Real arm
 # indices are >= 0, so any negative code is a group probe.
 _GROUP_CODE_BASE = -1
+
+#: `max_probe_age` when the run never reached steady state -- every slot was
+#: initialization, so Condition 1 was never in force and no probe age is
+#: defined. Distinct from 0, which would read as a perfect probe age.
+PROBE_AGE_NA = -1
+
+
+def format_probe_age(value: int) -> str:
+    return "n/a" if value == PROBE_AGE_NA else str(value)
 
 
 @dataclass
@@ -62,20 +73,6 @@ class RunMetrics:
             if time >= at_or_after:
                 return reason
         return ""
-
-    def as_row(self) -> dict[str, Any]:
-        return {
-            "total_regret": self.total_regret,
-            "decision_regret": self.decision_regret,
-            "probe_regret": self.probe_regret,
-            "decision_slots": self.decision_slots,
-            "probe_slots": self.probe_slots,
-            "max_probe_age": self.max_probe_age,
-            "n_detections": len(self.detections),
-            "first_detection": self.detections[0] if self.detections else "",
-            "first_detection_reason": self.first_detection_reason(),
-            "wall_time_s": self.wall_time_s,
-        }
 
 
 def _action_codes(chosen: list[Any]) -> tuple[np.ndarray, dict[str, int]]:
@@ -160,14 +157,19 @@ def max_probe_age(history: dict[str, Any], K: int) -> int:
     An arm counts as probed when it is pulled individually OR when it is part
     of a group probe (BP probes all arms; GE:k probes the arms of super-arm k).
     Measured after the leading initialization block -- see `_steady_state_start`.
+
+    Returns PROBE_AGE_NA if the whole run was initialization (which happens when
+    the ETC budget exceeds the horizon and preflight is overridden). Reporting 0
+    there would read as a perfect probe age when the truth is that Condition 1
+    never applied.
     """
     chosen = history["chosen_arm"]
     horizon = len(chosen)
     if horizon == 0:
-        return 0
+        return PROBE_AGE_NA
     window_start = _steady_state_start(history)
     if window_start > horizon:
-        return 0
+        return PROBE_AGE_NA
     codes, tag_codes = _action_codes(chosen)
     groups = history.get("groups") or []
 
