@@ -42,6 +42,8 @@ this still works correctly for change-magnitude/window-size tuning, since
 that part of the formula doesn't assume [0,1] rewards.
 """
 import math
+from collections import deque
+
 import numpy as np
 
 from bandit_base import BanditAlgorithm
@@ -81,7 +83,15 @@ class MUCB(BanditAlgorithm):
         K, T, w, b = self.K, self.T, self.w, self.b
         tau = 0
         n = np.zeros(K, dtype=int)
-        buffers = [[] for _ in range(K)]  # per-arm reward history since last reset
+        # Running sums give the UCB means in O(K) per round. The previous
+        # version called np.mean over each arm's full history every round,
+        # which is O(t - tau) per round and therefore O(T^2) overall: 17.7 s at
+        # K=64/T=60,000, and hours at T=1e6.
+        sums = np.zeros(K, dtype=float)
+        # CD (Algorithm 1) only ever inspects the most recent w rewards, so a
+        # bounded deque is sufficient and keeps memory at O(K*w) rather than
+        # O(T).
+        buffers = [deque(maxlen=w) for _ in range(K)]
         reward_hist, chosen_hist, detections = [], [], []
 
         for t in range(1, T + 1):
@@ -90,24 +100,26 @@ class MUCB(BanditAlgorithm):
             if A < K:
                 a_t = A  # forced uniform round-robin sampling
             else:
-                means = np.array([np.mean(buffers[k]) if n[k] > 0 else 0.0 for k in range(K)])
+                means = sums / np.maximum(n, 1)
                 ucb = means + np.sqrt(2 * math.log(max(t - tau, 2)) / np.maximum(n, 1))
                 a_t = int(np.argmax(ucb))
 
             r = reward_fn(a_t, t)
             n[a_t] += 1
+            sums[a_t] += r
             buffers[a_t].append(r)
             reward_hist.append(r)
             chosen_hist.append(a_t)
 
             # Algorithm 1 (CD): sliding-window mean-shift test
             if n[a_t] >= w:
-                recent = buffers[a_t][-w:]
+                recent = list(buffers[a_t])
                 stat = abs(sum(recent[w // 2:]) - sum(recent[:w // 2]))
                 if stat > b:
                     tau = t
                     n[:] = 0
-                    buffers = [[] for _ in range(K)]
+                    sums[:] = 0.0
+                    buffers = [deque(maxlen=w) for _ in range(K)]
                     detections.append(t)
 
         return dict(net_reward=sum(reward_hist), reward=reward_hist,

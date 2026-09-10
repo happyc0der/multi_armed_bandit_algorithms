@@ -1,42 +1,54 @@
 """
 test_fast_adswitch.py
 ----------------------
-Test cases + speed benchmark for fast_adswitch.FastAdSwitch, compared
-against the original recursive ADSWITCH.py logic from the repo.
+Test cases + speed benchmark for fast_adswitch.FastAdSwitch.
 
 Run with:  python test_fast_adswitch.py
-This will print the numeric results AND save two plots next to this file:
+           python test_fast_adswitch.py --compare-original   (slow; Test 3)
+
+Prints numeric results and saves plots under artifacts/:
   - regret_vs_horizon.png   (Test 1: cumulative regret shrinking with T)
   - switching_regret.png    (Test 2: reward tracking through 2 change points)
+  - speed_comparison.png    (Test 3, only with --compare-original)
+
+The reward environment is `synthetic_env.SyntheticEnv`, the same bounded
+scaled-Beta environment the main benchmark uses, rather than the private
+Gaussian generators this file used to carry. Two reasons: the numbers here are
+then directly comparable with test_algorithms.py, and the old generators drew
+from an unbounded Gaussian, which no bounded-reward algorithm in this repo is
+entitled to assume. Regret comes from `synthetic_env.regret_from_history`, which
+also fixes an off-by-one in the old Test 2 (it compared T oracle means against
+T-1 observed rewards).
 """
-import time
+import argparse
 import math
-import numpy as np
-import matplotlib.pyplot as plt
 import os
+import time
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+from fast_adswitch import FastAdSwitch
+from synthetic_env import SyntheticEnv, regret_from_history
+
 ARTIFACT_DIR = "artifacts"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
-from fast_adswitch import FastAdSwitch
+# Bounded-reward scale for these tests. sigma must stay below
+# R_max * sqrt(p(1-p)) for every arm mean; at means 0.2..0.8 on R_max=1 the
+# tightest bound is 0.4, so 0.25 is comfortably valid.
+R_MAX = 1.0
+SIGMA = 0.25
 
 
-# ---------------------------------------------------------------------
-# Reward environments
-# ---------------------------------------------------------------------
-def make_stationary_reward_fn(means, std, T, seed):
-    rng = np.random.default_rng(seed)
-    rewards = np.array([rng.normal(m, std, T + 2) for m in means])
-    return (lambda a, t: rewards[a, t]), np.asarray(means)
-
-
-def make_switching_reward_fn(K, T, std, seed, change_points, arm_means_segments):
-    rng = np.random.default_rng(seed)
-    segments = [0] + list(change_points) + [T + 2]
-    true_means = np.zeros((K, T + 2))
-    for i in range(len(segments) - 1):
-        true_means[:, segments[i]:segments[i + 1]] = np.array(arm_means_segments[i])[:, None]
-    rewards = rng.normal(true_means, std)
-    return (lambda a, t: rewards[a, t]), true_means
+def make_env(means, T, seed, change_schedule=None):
+    """One SyntheticEnv configured for these tests."""
+    return SyntheticEnv(
+        K=len(means), means=list(means), sigma=SIGMA, R_max=R_MAX,
+        change_schedule=list(change_schedule or []), seed=seed,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -48,11 +60,11 @@ def test_stationary_regret():
     Ts = [200, 500, 1000, 2000, 5000]
     regrets, regret_rates = [], []
     for T in Ts:
-        reward_fn, _ = make_stationary_reward_fn(means, 1.0, T, seed=1)
+        env = make_env(means, T, seed=1)
         t0 = time.time()
-        res = FastAdSwitch(3, T, C1=1.0, seed=1).run(reward_fn)
+        res = FastAdSwitch(3, T, C1=1.0, seed=1).run(env.reward_fn)
         dt = time.time() - t0
-        cum_regret = max(means) * T - res["net_reward"]
+        cum_regret = float(np.sum(regret_from_history(res, env.best_mean_history)))
         regrets.append(cum_regret)
         regret_rates.append(cum_regret / T)
         print(f"  T={T:5d}  time={dt:7.4f}s  net_reward={res['net_reward']:9.2f}"
@@ -80,21 +92,25 @@ def test_switching_environment():
     print("\n=== Test 2: piecewise-stationary bandit (2 change points) ===")
     T = 1500
     change_points = [500, 1000]
-    segments = [[0.8, 0.2, 0.5], [0.2, 0.8, 0.5], [0.5, 0.2, 0.8]]
-    reward_fn, true_means = make_switching_reward_fn(
-        3, T, 1.0, seed=2, change_points=change_points, arm_means_segments=segments
-    )
+    # SyntheticEnv changes one arm at a time, so each transition of the old
+    # three-segment table is expressed as the individual arm moves it implied.
+    change_schedule = [
+        (500, 0, 0.2), (500, 1, 0.8),
+        (1000, 1, 0.2), (1000, 2, 0.8), (1000, 0, 0.5),
+    ]
+    env = make_env([0.8, 0.2, 0.5], T, seed=2, change_schedule=change_schedule)
     t0 = time.time()
-    res = FastAdSwitch(3, T, C1=1.0, seed=2).run(reward_fn)
+    res = FastAdSwitch(3, T, C1=1.0, seed=2).run(env.reward_fn)
     dt = time.time() - t0
-    best_per_t = true_means.max(axis=0)[1:T + 1]
-    cum_regret = best_per_t.sum() - res["net_reward"]
+    per_slot_regret = np.asarray(regret_from_history(res, env.best_mean_history))
+    best_per_t = np.asarray([env.best_mean_history[t] for t in range(1, T + 1)])
+    cum_regret = float(per_slot_regret.sum())
     print(f"  time={dt:.3f}s  net_reward={res['net_reward']:.2f}"
           f"  optimal={best_per_t.sum():.2f}  cum_regret={cum_regret:.2f}")
 
     # rolling average reward vs the (moving) optimal reward, to visualise tracking
     window = 50
-    reward_hist = res["reward"][1:T + 1]
+    reward_hist = np.asarray(res["reward"])
     def rolling(x, w):
         c = np.cumsum(np.insert(x, 0, 0))
         return (c[w:] - c[:-w]) / w
@@ -271,9 +287,9 @@ def test_speed_comparison():
         run_original(3, T, [0.2, 0.5, 0.8], seed=1, C1=1.0)
         t_orig = time.time() - t0
 
-        reward_fn, _ = make_stationary_reward_fn([0.2, 0.5, 0.8], 1.0, T, seed=1)
+        env = make_env([0.2, 0.5, 0.8], T, seed=1)
         t0 = time.time()
-        FastAdSwitch(3, T, C1=1.0, seed=1).run(reward_fn)
+        FastAdSwitch(3, T, C1=1.0, seed=1).run(env.reward_fn)
         t_fast = time.time() - t0
 
         Ts.append(T); t_origs.append(t_orig); t_fasts.append(t_fast)
@@ -293,6 +309,19 @@ def test_speed_comparison():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--compare-original", action="store_true",
+        help="also run Test 3, the speed comparison against the original recursive "
+             "AdSwitch kept in this file as a reference oracle. It is quadratic in T "
+             "and only runs to T=300, so it is off by default.",
+    )
+    options = parser.parse_args()
+
     test_stationary_regret()
     test_switching_environment()
-    test_speed_comparison()
+    if options.compare_original:
+        test_speed_comparison()
+    else:
+        print("\n=== Test 3 (speed vs original) skipped; pass --compare-original to run it ===")

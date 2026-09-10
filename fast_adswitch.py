@@ -18,7 +18,7 @@ Fixing this dropped cumulative regret on a K=2, T=6000 test from ~15,733
 to ~1,433 -- confirmed not a minor effect.
 
 =====================================================================
-Fix #2 (this pass): vectorized condition (3), ~3x faster
+Fix #2: vectorized condition (3), ~3x faster
 =====================================================================
 The corrected condition (3) was still implemented as nested Python loops
 over dict-keyed candidate windows, re-run from scratch every single round.
@@ -26,6 +26,59 @@ Replaced with vectorized numpy array operations (same dyadic-window
 candidate set from the paper's Remark 3, same result), cutting runtime
 from ~2.5s to ~0.8s for a K=2, T=6000 run. Verified bit-for-bit identical
 regret before/after (1433.12 in both versions on the same seed).
+
+=====================================================================
+Fix #3 (this pass): condition (4) was 89-96% of the runtime, and O(K*T^2)
+=====================================================================
+Profiling one K=16 seed showed condition (4) taking 88.8% of wall time at
+T=10,000, 93.2% at T=20,000 and 95.6% at T=40,000 -- it grew as the square
+of the horizon while conditions (1) and (3) stayed under 6% combined. The
+cause: it rebuilt `sigmas = np.arange(episode_start, t+1)` and rescanned it
+for EVERY bad arm on EVERY round, i.e. O(K * episode_len) per round.
+
+Two restrictions fix it, and both are exact rather than approximations:
+
+  1. An arm's test value can only change on a round where that arm was
+     PULLED. If arm a is not pulled at round t then count(a, sigma..t) and
+     sum(a, sigma..t) are unchanged for every existing sigma, and the one
+     new candidate sigma = t has count 0, which the `c > 0` mask already
+     discards. So the max over sigma is identical to the previous round's,
+     which did not trigger -- otherwise we would have restarted then.
+     Bad arms are pulled only when a sampling obligation fires, so this
+     alone removes almost all the work.
+  2. Within an arm, sigma only needs to range over that arm's OWN pull
+     times. count(a, sigma..t) decreases by one exactly as sigma passes a
+     pull of a, so the pull times enumerate every distinct (count, mean)
+     pair the full [episode_start, t] range would produce, and the test's
+     bound depends on sigma only through that count.
+
+Conditions (1), (3) and (4) now all evaluate on restricted sigma grids, in
+the spirit of the paper's Remark 3.
+
+Measured, verified to produce IDENTICAL `chosen_arm` and `detections`:
+
+    K=16  T= 20,000    11.86s ->  0.71s   16.6x
+    K=16  T= 40,000    38.52s ->  1.47s   26.1x
+    K=64  T= 20,000    50.78s ->  2.77s   18.3x
+    K=16  T=100,000   218.62s ->  3.73s   58.6x
+
+Scaling is now near-linear in T (K=64: 11.0s at T=1e5, 19.2s at T=2e5)
+rather than the ~T^1.7 it was before.
+
+=====================================================================
+Fix #4 (this pass): O(K*T) memory -> O(T)
+=====================================================================
+`cum_reward` and `cum_count` were dense (K, T+2) float64 arrays -- 410 MB
+at K=128/T=2e5 and 2.0 GB at K=128/T=1e6, which put the large-K benchmark
+cases out of reach entirely. Every round also copied a whole K-element
+column forward just to carry values that had not changed.
+
+They are now per-arm sparse prefix sums: for each arm, the ascending list
+of its own pull times plus the running reward total at each. Since every
+round appends to exactly one arm, total storage is O(T) across all arms
+regardless of K, and nothing needs carrying forward. Interval queries go
+through `count_iv` / `mean_iv` / `_window_stats`, which binary-search the
+arm's own time array.
 
 =====================================================================
 Added: detection/eviction tracking, and a real diagnosis of high variance
@@ -88,23 +141,73 @@ class FastAdSwitch(BanditAlgorithm):
         K, T, C1 = self.K, self.T, self.C1
         logT = math.log(max(T, 2))
 
-        cum_reward = np.zeros((K, T + 2))
-        cum_count = np.zeros((K, T + 2))
+        # ---- per-arm sparse prefix sums (see Fix #4) --------------------
+        # pull_time[a][:n_pulls[a]] is arm a's ascending pull times;
+        # pull_csum[a][i] is the reward total over its first i pulls, so
+        # pull_csum[a][0] == 0. Capacity doubles on demand, giving O(T)
+        # total storage across all arms instead of O(K*T).
+        pull_time = [np.zeros(8, dtype=np.int64) for _ in range(K)]
+        pull_csum = [np.zeros(9, dtype=np.float64) for _ in range(K)]
+        n_pulls = [0] * K
         last_chosen = np.zeros(K, dtype=np.int64)
+
+        def record_pull(a, when, reward):
+            n = n_pulls[a]
+            if n == pull_time[a].size:
+                pull_time[a] = np.concatenate(
+                    (pull_time[a], np.zeros(n, dtype=np.int64))
+                )
+                pull_csum[a] = np.concatenate(
+                    (pull_csum[a], np.zeros(n, dtype=np.float64))
+                )
+            pull_time[a][n] = when
+            pull_csum[a][n + 1] = pull_csum[a][n] + reward
+            n_pulls[a] = n + 1
+
+        def _bounds(a, s, e):
+            times = pull_time[a][:n_pulls[a]]
+            return (int(np.searchsorted(times, s, side="left")),
+                    int(np.searchsorted(times, e, side="right")))
+
+        def _window_stats(a, s_arr, e_arr):
+            """Vectorized (count, sum) over many inclusive [s, e] windows."""
+            times = pull_time[a][:n_pulls[a]]
+            lo = np.searchsorted(times, s_arr, side="left")
+            hi = np.searchsorted(times, e_arr, side="right")
+            return (hi - lo).astype(np.float64), pull_csum[a][hi] - pull_csum[a][lo]
+
+        def _suffix_stats(a, s_arr):
+            """Vectorized (count, sum) over many [s, now] windows.
+
+            Conditions (1) and (4) always end their window at the current round,
+            which is at or after every recorded pull, so the upper index is just
+            the pull count and only one binary search is needed instead of two.
+            """
+            n = n_pulls[a]
+            times = pull_time[a][:n]
+            lo = np.searchsorted(times, s_arr, side="left")
+            return (n - lo).astype(np.float64), pull_csum[a][n] - pull_csum[a][lo]
 
         def mean_iv(a, s, e):
             if e < s:
                 return 0.0
-            c = cum_count[a, e + 1] - cum_count[a, s]
-            return 0.0 if c == 0 else (cum_reward[a, e + 1] - cum_reward[a, s]) / c
+            lo, hi = _bounds(a, s, e)
+            c = hi - lo
+            return 0.0 if c == 0 else float(pull_csum[a][hi] - pull_csum[a][lo]) / c
 
         def count_iv(a, s, e):
-            return 0 if e < s else cum_count[a, e + 1] - cum_count[a, s]
+            if e < s:
+                return 0
+            lo, hi = _bounds(a, s, e)
+            return hi - lo
 
         good, bad = set(range(K)), set()
         sampling_oblig = {a: [] for a in range(K)}
         eviction_gap = {a: None for a in range(K)}
         eviction_mean = {a: None for a in range(K)}
+        # Arms whose condition-(4) test value may have moved this round: the
+        # arm just pulled, plus any arm just evicted (its first ever test).
+        recheck = set()
 
         net_reward = 0.0
         reward_hist, chosen_hist = [], []
@@ -119,14 +222,13 @@ class FastAdSwitch(BanditAlgorithm):
             sampling_oblig = {a: [] for a in range(K)}
             eviction_gap = {a: None for a in range(K)}
             eviction_mean = {a: None for a in range(K)}
+            recheck.clear()
             episode_start = t + 1
 
         start_new_episode()
 
         while t < T:
             t += 1
-            cum_reward[:, t + 1] = cum_reward[:, t]
-            cum_count[:, t + 1] = cum_count[:, t]
             new_bad = set(bad)
 
             for a in list(bad):
@@ -147,9 +249,10 @@ class FastAdSwitch(BanditAlgorithm):
             candidates = list(good) + [a for a in bad if sampling_oblig[a]]
             chosen = min(candidates, key=lambda a: last_chosen[a])
             r = reward_fn(chosen, t)
-            cum_reward[chosen, t + 1] += r
-            cum_count[chosen, t + 1] += 1
+            record_pull(chosen, t, r)
             last_chosen[chosen] = t
+            if chosen in bad:
+                recheck.add(chosen)
             net_reward += r
             reward_hist.append(r)
             chosen_hist.append(chosen)
@@ -167,8 +270,7 @@ class FastAdSwitch(BanditAlgorithm):
                 s1_arr = np.array([w[0] for w in cw])
                 s2_arr = np.array([w[1] for w in cw])
                 for a in good:
-                    c_w = cum_count[a, s2_arr + 1] - cum_count[a, s1_arr]
-                    r_w = cum_reward[a, s2_arr + 1] - cum_reward[a, s1_arr]
+                    c_w, r_w = _window_stats(a, s1_arr, s2_arr)
                     valid = c_w > 0
                     if not np.any(valid):
                         continue
@@ -184,11 +286,18 @@ class FastAdSwitch(BanditAlgorithm):
                         break
 
             # ---- condition (4): bad-arm recheck ----
+            # Only arms whose statistics actually moved, and within an arm only
+            # its own pull times as sigma candidates. Both restrictions are
+            # exact -- see Fix #3 in the module docstring.
             if not restart:
-                sigmas = np.arange(episode_start, t + 1)
-                for a in bad:
-                    c = cum_count[a, t + 1] - cum_count[a, sigmas]
-                    s = cum_reward[a, t + 1] - cum_reward[a, sigmas]
+                for a in recheck & bad:
+                    n = n_pulls[a]
+                    times = pull_time[a][:n]
+                    first = int(np.searchsorted(times, episode_start, side="left"))
+                    sigmas = times[first:]
+                    if sigmas.size == 0:
+                        continue
+                    c, s = _suffix_stats(a, sigmas)
                     with np.errstate(invalid="ignore", divide="ignore"):
                         m = np.where(c > 0, s / np.where(c == 0, 1, c), 0.0)
                     bound = eviction_gap[a] / 4.0 + np.sqrt(2 * logT / np.where(c == 0, 1, c))
@@ -197,6 +306,7 @@ class FastAdSwitch(BanditAlgorithm):
                         restart = True
                         restart_reason = "bad_arm_change"
                         break
+            recheck.clear()
 
             if restart:
                 detections.append((t, restart_reason))
@@ -218,8 +328,7 @@ class FastAdSwitch(BanditAlgorithm):
                 means = np.zeros((len(gl), len(sigmas)))
                 counts = np.zeros((len(gl), len(sigmas)))
                 for idx, a in enumerate(gl):
-                    c = cum_count[a, t + 1] - cum_count[a, sigmas]
-                    s = cum_reward[a, t + 1] - cum_reward[a, sigmas]
+                    c, s = _suffix_stats(a, sigmas)
                     with np.errstate(invalid="ignore", divide="ignore"):
                         means[idx] = np.where(c > 0, s / np.where(c == 0, 1, c), 0.0)
                     counts[idx] = c
@@ -244,6 +353,9 @@ class FastAdSwitch(BanditAlgorithm):
                     new_bad.add(a)
                     eviction_mean[a] = mean_iv(a, s_val, t)
                     eviction_gap[a] = left_val
+                    # First condition-(4) evaluation for this arm happens next
+                    # round; it has never been tested before.
+                    recheck.add(a)
                     sampling_oblig[a] = []
                     evictions.append((t, a))
 
